@@ -28,10 +28,11 @@ from collections import defaultdict, deque
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from enum import IntEnum
-from math import hypot, isclose
+from itertools import chain
+from math import hypot, inf, isclose
 from operator import itemgetter
 from timeit import default_timer as timer
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import bmesh
 import bpy
@@ -1027,6 +1028,16 @@ class UvVertex:
     bm_loops: List[bmesh.types.BMLoop] = field(
         default_factory=list, compare=False, repr=False
     )
+    faces: Set[bmesh.types.BMFace] = field(
+        default_factory=set, compare=False, repr=False
+    )
+
+    @property
+    def coordinates_array(self) -> np.ndarray:
+        return np.array(self.coordinates)
+
+    def hypot(self, other: "UvVertex"):
+        return np.linalg.norm(self.coordinates_array - other.coordinates_array)
 
 
 class CoordinateVertexDict(dict):
@@ -1125,11 +1136,51 @@ class UvVertexCollection:
             second_bfs_distances = self.bfs_traverse(farthest)
             verts, distances = list(zip(*second_bfs_distances))
             if len(set(distances)) < len(distances):
-                raise ValueError(f"Found non-linear vertex set, size {len(distances)}")
+                raise ValueError(f"Found non-linear vertex set, size {len(verts)}")
             sorted_vertex_subsets.append(verts)
             unsorted_vertices -= set(verts)
 
         return sorted_vertex_subsets
+
+    def boundary_shortest_path(
+        self, source: UvVertex
+    ) -> Iterable[Tuple[UvVertex, float]]:
+        """
+        Probably only makes sense `if not self.selection_only`.
+        If no path exists, raises a ValueError.
+        Distance is cumulative UV distance across boundary edges.
+        """
+        dist = {vert: inf for vert in self.boundary_vertices}
+        dist[source] = 0
+        heap = heapdict()
+        heap[source] = dist[source]
+        while heap:
+            u, d_u = heap.popitem()
+            if u is not source:
+                yield u, d_u
+            neighbors = self.get_neighbors(u) & self.boundary_vertices
+            for v in neighbors:
+                d_uv = u.hypot(v)
+                new_dist_v = d_u + d_uv
+                if new_dist_v < dist[v]:
+                    dist[v] = new_dist_v
+                    heap[v] = new_dist_v
+
+    def dfs_boundary(self, start: UvVertex) -> Iterable[Tuple[UvVertex, float]]:
+        # TODO: deduplicate
+        seen = set()
+        # (vertex, parent), using 'start' as its own parent results
+        # in distance 0, which is appropriate
+        q = deque([(start, start)])
+        while q:
+            vert, parent = q.pop()
+            if vert in seen:
+                continue
+            seen.add(vert)
+            dist = vert.hypot(parent)
+            yield vert, dist
+            new_verts = (self.get_neighbors(vert) - seen) & self.boundary_vertices
+            q.extend((new_vert, vert) for new_vert in new_verts)
 
 
 def align_vertex_subset_preserve_dist(vert_subset: Sequence[UvVertex]) -> np.ndarray:
@@ -1193,6 +1244,179 @@ CORNER_NEIGHBORS = {
 }
 
 
+def get_closest_corner_to_vert(
+    vertex: UvVertex,
+    corner_candidates: List[RectangleCorner],
+    bbox_coords: np.ndarray,
+) -> Tuple[RectangleCorner, np.ndarray]:
+    uv_dists = vertex.coordinates_array - bbox_coords[corner_candidates, :]
+    hypot_dists = np.hypot(uv_dists[:, 0], uv_dists[:, 1])
+    closest_corner_index = np.argmin(hypot_dists)
+    closest_corner = corner_candidates[closest_corner_index]
+    new_pos = bbox_coords[closest_corner, :]
+
+    return closest_corner, new_pos
+
+
+def assign_verts_to_bounding_box_corners(
+    vc_sel: UvVertexCollection, vc_all: UvVertexCollection
+):
+    if len(vc_sel.vertices) > 4:
+        raise ValueError("Can't snap more than 4 vertices")
+
+    # Choose first vertex by distance to bounding box corners, choose
+    # rest by shortest-path distance along boundary, constrain successive
+    # closest-corner selections to CORNER_NEIGHBORS
+    vertex_list = list(vc_sel.vertices)
+    coords_orig = np.array([v.coordinates for v in vertex_list])
+
+    min_point = np.min(coords_orig, axis=0)
+    max_point = np.max(coords_orig, axis=0)
+
+    # must match order of RectangleCorner enum
+    bbox_coords = np.array(
+        [
+            min_point,
+            [max_point[0], min_point[1]],
+            [min_point[0], max_point[1]],
+            max_point,
+        ]
+    )
+
+    new_positions: List[Tuple[UvVertex, np.ndarray]] = []
+
+    uv_dists = [coord - bbox_coords for coord in coords_orig]
+    hypot_dists = np.array(
+        [np.hypot(uv_dist[:, 0], uv_dist[:, 1]) for uv_dist in uv_dists]
+    )
+
+    vert_index, closest_corner = np.unravel_index(
+        np.argmin(hypot_dists), hypot_dists.shape
+    )
+    # Need a list of vertices to use the result of np.argmin
+    # (index of closest vertex to any bounding box corner), but after
+    # this we use shortest-path boundary traversal, so a set of
+    # vertices seems more appropriate. Linear time to find or
+    # remove an element of this list wouldn't matter at all since we
+    # know the list can contain at most 3 elements after this initial
+    # removal -- it still feels weird though, so use a set.
+    # I would say that unnecessary quadratic runtime always feels wrong,
+    # but a hard upper bound on the size of the input means it's
+    # technically O(1) time ;)
+    vert = vertex_list.pop(vert_index)
+    corner = RectangleCorner(closest_corner)
+    coord = bbox_coords[closest_corner, :]
+    new_positions.append((vert, coord))
+
+    remaining_corners = set(RectangleCorner) - {corner}
+    remaining_verts = set(vertex_list)
+
+    while remaining_verts:
+        for vert, dist in vc_all.boundary_shortest_path(vert):
+            if vert in remaining_verts:
+                break
+        else:
+            message_pieces = ["Found selected vertex(es) not on UV island boundary:"]
+            message_pieces.extend(str(v.coordinates_array) for v in remaining_verts)
+            raise ValueError("\n".join(message_pieces))
+        corner_choices = list(remaining_corners & CORNER_NEIGHBORS[corner])
+        corner, coord = get_closest_corner_to_vert(vert, corner_choices, bbox_coords)
+        new_positions.append((vert, coord))
+        remaining_verts.remove(vert)
+        remaining_corners.remove(corner)
+
+    return new_positions
+
+
+def get_coords(
+    vert: UvVertex, position_override: Optional[Dict[UvVertex, np.ndarray]]
+) -> np.ndarray:
+    if position_override is not None:
+        if vert in position_override:
+            return position_override[vert]
+    return vert.coordinates_array
+
+
+def align_unselected_boundary_verts(
+    vc_sel: UvVertexCollection,
+    vc_all: UvVertexCollection,
+    pos_override: Optional[Dict[UvVertex, np.ndarray]] = None,
+):
+    """
+    :param pos_override: new positions for the selected corner vertices.
+    Real corner vertex positions will be used for calculating UV distance
+    across boundary edges from one selected vertex to another, but these
+    new positions will be used to calculate where unselected boundary
+    vertices should be placed.
+    """
+    selected_boundary_vertices = vc_sel.vertices & vc_all.boundary_vertices
+    if len(selected_boundary_vertices) < 3:
+        raise ValueError("Need at least 3 selected boundary vertices")
+
+    start = next(iter(selected_boundary_vertices))
+
+    boundary_edge_chains = []
+    curr_chain = []
+    for vert, parent_dist in vc_all.dfs_boundary(start):
+        curr_chain.append((vert, parent_dist))
+        if vert in vc_sel.vertices:
+            boundary_edge_chains.append(curr_chain)
+            curr_chain = [(vert, 0)]
+    # Special handling since we don't return the start
+    # vertex from that DFS traversal
+    most_recent_vert = curr_chain[-1][0]
+    assert start in vc_all.get_neighbors(most_recent_vert)
+    curr_chain.append((start, start.hypot(most_recent_vert)))
+    boundary_edge_chains.append(curr_chain)
+
+    # Each boundary chain of vertices starts and ends with a selected
+    # vertex, so there's nothing for us to do here unless there's at
+    # least one intermediate vertex
+    filtered_chains = [c for c in boundary_edge_chains if len(c) >= 3]
+
+    new_positions = []
+    for chain in filtered_chains:
+        verts, distances = list(zip(*chain))
+        start, end = verts[0], verts[-1]
+        start_pos_base = get_coords(start, pos_override)
+        direction = get_coords(end, pos_override) - start_pos_base
+        dist_cumsum = np.cumsum(distances)
+        cumsum_proportion = dist_cumsum / dist_cumsum[-1]
+        chain_pos = []
+        for vert, dist_from_start in zip(verts, cumsum_proportion):
+            new_pos = start_pos_base + direction * dist_from_start
+            chain_pos.append((vert, new_pos))
+        # Don't adjust start and end, in case of numerical instability
+        new_positions.extend(chain_pos[1:-1])
+
+    return new_positions
+
+
+class UV_MultiObjAlignOperator(bpy.types.Operator):
+    @classmethod
+    def poll(cls, context):
+        return context.mode == "EDIT_MESH"
+
+    def execute(self, context):
+        # TODO: deduplicate
+        if context.scene.tool_settings.use_uv_select_sync:
+            self.report({"ERROR"}, "Please disable 'Keep UV and edit mesh in sync'")
+            return
+
+        selected_objects = context.selected_objects
+        if context.edit_object not in selected_objects:
+            selected_objects.append(context.edit_object)
+
+        for obj in selected_objects:
+            if obj.type == "MESH":
+                try:
+                    self.align(obj)
+                except ValueError as e:
+                    self.report({"ERROR"}, e.args[0])
+
+        return {"FINISHED"}
+
+
 class UV_PT_UvSquares(bpy.types.Operator):
     """Reshapes UV faces to a grid of equivalent squares"""
 
@@ -1223,6 +1447,74 @@ class UV_PT_UvSquaresByShape(bpy.types.Operator):
     def execute(self, context):
         main(context, self)
         return {"FINISHED"}
+
+
+class UV_PT_SnapToBoundingBoxCorners(UV_MultiObjAlignOperator):
+    """Snap selected vertices to the corners of the bounding box of those vertices, walking the boundary of the UV island to select successive vertices and corners."""
+
+    bl_idname = "uv.uv_snap_to_bounding_box_corners"
+    bl_label = "UV snap 4 vertices to bounding box corners"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def align(self, obj):
+        start_time = timer()
+
+        vc_sel = UvVertexCollection.populate(obj, selection_only=True)
+        vc_all = UvVertexCollection.populate(obj, selection_only=False)
+
+        new_positions = assign_verts_to_bounding_box_corners(vc_sel, vc_all)
+        for v, coord in new_positions:
+            for bml in v.bm_loops:
+                bml[vc_sel.uv_layer].uv = coord
+
+        return success_finished(obj.data, start_time)
+
+
+class UV_PT_AlignVertsBetweenBoundarySelection(UV_MultiObjAlignOperator):
+    """Snap boundary vertices to lines between selected vertices, scaling distances proportionally."""
+
+    bl_idname = "uv.uv_align_verts_between_boundary_selection"
+    bl_label = "UV align boundary vertices between selection"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def align(self, obj):
+        start_time = timer()
+
+        vc_sel = UvVertexCollection.populate(obj, selection_only=True)
+        vc_all = UvVertexCollection.populate(obj, selection_only=False)
+
+        new_positions = align_unselected_boundary_verts(vc_sel, vc_all)
+        for vert, new_pos in new_positions:
+            for bml in vert.bm_loops:
+                bml[vc_sel.uv_layer].uv = new_pos
+                bml[vc_sel.uv_layer].select = True
+
+        return success_finished(obj.data, start_time)
+
+
+class UV_PT_AlignBoundaryVertsToBoundingBox(UV_MultiObjAlignOperator):
+    """Snap boundary vertices to lines between selected vertices, scaling distances proportionally."""
+
+    bl_idname = "uv.uv_align_boundary_verts_to_bounding_box"
+    bl_label = "UV align boundary vertices to bounding box"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def align(self, obj):
+        start_time = timer()
+
+        vc_sel = UvVertexCollection.populate(obj, selection_only=True)
+        vc_all = UvVertexCollection.populate(obj, selection_only=False)
+
+        corner_pos = assign_verts_to_bounding_box_corners(vc_sel, vc_all)
+        pos_override = dict(corner_pos)
+
+        new_positions = align_unselected_boundary_verts(vc_sel, vc_all, pos_override)
+        for vert, new_pos in chain(corner_pos, new_positions):
+            for bml in vert.bm_loops:
+                bml[vc_sel.uv_layer].uv = new_pos
+                bml[vc_sel.uv_layer].select = True
+
+        return success_finished(obj.data, start_time)
 
 
 class UV_PT_RipFaces(bpy.types.Operator):
@@ -1290,35 +1582,12 @@ class UV_PT_SnapToAxisWithEqual(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class UV_PT_SnapToAxisPreserveDist(bpy.types.Operator):
+class UV_PT_SnapToAxisPreserveDist(UV_MultiObjAlignOperator):
     """Snap selected vertices to axis, preserving distance"""
 
     bl_idname = "uv.uv_snap_to_axis_preserve_dist"
     bl_label = "UV snap vertices to axis preserving original distances"
     bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context):
-        return context.mode == "EDIT_MESH"
-
-    def execute(self, context):
-        # TODO: deduplicate
-        if context.scene.tool_settings.use_uv_select_sync:
-            self.report({"ERROR"}, "Please disable 'Keep UV and edit mesh in sync'")
-            return
-
-        selected_objects = context.selected_objects
-        if context.edit_object not in selected_objects:
-            selected_objects.append(context.edit_object)
-
-        for obj in selected_objects:
-            if obj.type == "MESH":
-                try:
-                    self.align(obj)
-                except ValueError as e:
-                    self.report({"ERROR"}, e.args[0])
-
-        return {"FINISHED"}
 
     def align(self, obj):
         start_time = timer()
@@ -1389,6 +1658,26 @@ class UV_PT_UvSquaresPanel(bpy.types.Panel):
         )
 
         row = layout.row()
+        row.label(text="Boundary Vertices:")
+        split = layout.split()
+        col = split.column(align=True)
+        col.operator(
+            UV_PT_SnapToBoundingBoxCorners.bl_idname,
+            text="3-4 Verts to Bounding Box",
+            icon="SNAP_GRID",
+        )
+        col.operator(
+            UV_PT_AlignVertsBetweenBoundarySelection.bl_idname,
+            text="Align Unselected",
+            icon="THREE_DOTS",
+        )
+        col.operator(
+            UV_PT_AlignBoundaryVertsToBoundingBox.bl_idname,
+            text="Align To Bounding Box",
+            icon="THREE_DOTS",
+        )
+
+        row = layout.row()
         row.label(text='Convert "Rectangle" (4 corners):')
         split = layout.split()
         col = split.column(align=True)
@@ -1397,12 +1686,7 @@ class UV_PT_UvSquaresPanel(bpy.types.Panel):
         )
         col.operator(UV_PT_UvSquares.bl_idname, text="To Square Grid", icon="GRID")
 
-        split = layout.split()
-        col = split.column(align=True)
-        row = col.row(align=True)
-
         row = layout.row()
-
         row.label(text="Select Faces or Vertices to:")
         split = layout.split()
         col = split.column(align=True)
@@ -1423,11 +1707,14 @@ def register():
     bpy.utils.register_class(UV_PT_UvSquaresPanel)
     bpy.utils.register_class(UV_PT_UvSquares)
     bpy.utils.register_class(UV_PT_UvSquaresByShape)
+    bpy.utils.register_class(UV_PT_SnapToBoundingBoxCorners)
     bpy.utils.register_class(UV_PT_RipFaces)
     bpy.utils.register_class(UV_PT_JoinFaces)
     bpy.utils.register_class(UV_PT_SnapToAxis)
     bpy.utils.register_class(UV_PT_SnapToAxisWithEqual)
     bpy.utils.register_class(UV_PT_SnapToAxisPreserveDist)
+    bpy.utils.register_class(UV_PT_AlignVertsBetweenBoundarySelection)
+    bpy.utils.register_class(UV_PT_AlignBoundaryVertsToBoundingBox)
 
     # menu
     bpy.types.IMAGE_MT_uvs.append(menu_func_uv_squares)
@@ -1460,11 +1747,14 @@ def unregister():
     bpy.utils.unregister_class(UV_PT_UvSquaresPanel)
     bpy.utils.unregister_class(UV_PT_UvSquares)
     bpy.utils.unregister_class(UV_PT_UvSquaresByShape)
+    bpy.utils.unregister_class(UV_PT_SnapToBoundingBoxCorners)
     bpy.utils.unregister_class(UV_PT_RipFaces)
     bpy.utils.unregister_class(UV_PT_JoinFaces)
     bpy.utils.unregister_class(UV_PT_SnapToAxis)
     bpy.utils.unregister_class(UV_PT_SnapToAxisWithEqual)
     bpy.utils.unregister_class(UV_PT_SnapToAxisPreserveDist)
+    bpy.utils.unregister_class(UV_PT_AlignVertsBetweenBoundarySelection)
+    bpy.utils.unregister_class(UV_PT_AlignBoundaryVertsToBoundingBox)
 
     bpy.types.IMAGE_MT_uvs.remove(menu_func_uv_squares)
     bpy.types.IMAGE_MT_uvs.remove(menu_func_uv_squares_by_shape)
