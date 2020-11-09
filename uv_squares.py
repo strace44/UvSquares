@@ -27,6 +27,7 @@ bl_info = {
 from collections import defaultdict, deque
 from collections.abc import MutableMapping
 from dataclasses import dataclass, field
+from enum import IntEnum
 from math import hypot, isclose
 from operator import itemgetter
 from timeit import default_timer as timer
@@ -1147,6 +1148,38 @@ def align_vertex_subset_preserve_dist(vert_subset: Sequence[UvVertex]) -> np.nda
 
     new_coords = min(new_coord_choices, key=itemgetter(1))[0]
     return new_coords
+
+
+class RectangleCorner(IntEnum):
+    """
+    This is an IntEnum so we can use lists of these objects
+    as indexes into NumPy arrays
+    """
+
+    BOTTOM_LEFT = 0
+    BOTTOM_RIGHT = 1
+    TOP_LEFT = 2
+    TOP_RIGHT = 3
+
+
+CORNER_NEIGHBORS = {
+    RectangleCorner.BOTTOM_LEFT: {
+        RectangleCorner.BOTTOM_RIGHT,
+        RectangleCorner.TOP_LEFT,
+    },
+    RectangleCorner.BOTTOM_RIGHT: {
+        RectangleCorner.BOTTOM_LEFT,
+        RectangleCorner.TOP_RIGHT,
+    },
+    RectangleCorner.TOP_LEFT: {
+        RectangleCorner.BOTTOM_LEFT,
+        RectangleCorner.TOP_RIGHT,
+    },
+    RectangleCorner.TOP_RIGHT: {
+        RectangleCorner.TOP_LEFT,
+        RectangleCorner.BOTTOM_RIGHT,
+    },
+}
 
 
 class UV_PT_UvSquares(bpy.types.Operator):
