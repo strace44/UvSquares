@@ -1041,35 +1041,46 @@ class UvVertexCollection:
     obj: bpy.types.Object
     bm: bmesh.types.BMesh
     uv_layer: bmesh.types.BMLayerItem
+    selection_only: bool
     vertices: Set[UvVertex] = field(default_factory=set)
+    boundary_vertices: Set[UvVertex] = field(default_factory=set)
     coordinate_mapping: Dict[Tuple[float, float], UvVertex] = field(
         default_factory=CoordinateVertexDict
     )
     loop_vert_mapping: Dict[bmesh.types.BMLoop, UvVertex] = field(default_factory=dict)
 
     @classmethod
-    def populate(cls, obj):
+    def populate(cls, obj, selection_only=True):
         bm = bmesh.from_edit_mesh(obj.data)
         uv_layer = bm.loops.layers.uv.verify()
 
-        self = cls(obj=obj, bm=bm, uv_layer=uv_layer)
+        self = cls(obj=obj, bm=bm, uv_layer=uv_layer, selection_only=selection_only)
 
         for f in bm.faces:
+            # 'selection_only' applies to UV vertices; we still only want to
+            # adjust faces that are selected in the 3D viewport edit mode
             if not f.select:
                 continue
 
             for loop in f.loops:
                 luv = loop[uv_layer]
-                if luv.select:
+                if luv.select or not self.selection_only:
                     vertex = self.coordinate_mapping[tuple(luv.uv)]
                     vertex.bm_loops.append(loop)
+                    vertex.faces.add(f)
                     self.loop_vert_mapping[loop] = vertex
 
         self.vertices.update(self.coordinate_mapping.values())
 
+        for v in self.vertices:
+            if len(self.get_neighbors(v)) > len(v.faces):
+                # TODO: store this directly in the UvVertex, hopefully
+                #   without breaking immutability
+                self.boundary_vertices.add(v)
+
         return self
 
-    def get_selected_neighbors(self, v: UvVertex) -> Set[UvVertex]:
+    def get_neighbors(self, v: UvVertex) -> Set[UvVertex]:
         # Can't be a method on the UvVertex class, since we need to use the
         # mapping from BMLoopUV objects to UvVertex instances
 
@@ -1079,15 +1090,15 @@ class UvVertexCollection:
         # more than once. Could separate this into a generator function that
         # yields duplicate UvVertex objects, and a wrapper that just calls
         # set(that_generator()), but I don't see any benefit
-        selected_neighbors: Set[UvVertex] = set()
+        neighbors: Set[UvVertex] = set()
         for bml in v.bm_loops:
             loop_neighbors = [bml.link_loop_prev, bml.link_loop_next]
 
             for ln in loop_neighbors:
-                if ln[self.uv_layer].select:
-                    selected_neighbors.add(self.loop_vert_mapping[ln])
+                if ln[self.uv_layer].select or not self.selection_only:
+                    neighbors.add(self.loop_vert_mapping[ln])
 
-        return selected_neighbors
+        return neighbors
 
     def bfs_traverse(self, start: UvVertex) -> Iterable[Tuple[UvVertex, int]]:
         seen = set()
@@ -1096,7 +1107,7 @@ class UvVertexCollection:
             v, dist = q.popleft()
             seen.add(v)
             yield v, dist
-            new_verts = self.get_selected_neighbors(v) - seen
+            new_verts = self.get_neighbors(v) - seen
             new_dist = dist + 1
             q.extend((new_vert, new_dist) for new_vert in new_verts)
 
